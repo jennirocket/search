@@ -1,0 +1,23 @@
+# Build results
+bin/
+obj/
+publish/
+
+# IDE
+.vs/
+.vscode/
+*.swp
+*.swo
+*~
+
+# User files
+index.json
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+.env
+.env.local
