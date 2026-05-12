@@ -93,7 +93,7 @@ search --update-index -d C      # Update index for specific drive
 
 ## How It Works
 
-1. **Indexing** - Scans your drives recursively and builds a JSON index stored in `%APPDATA%\FileSearch\index.json`
+1. **Indexing** - Scans your drives recursively and builds a compressed JSON index stored in `%APPDATA%\FileSearch\index.json`
 2. **Searching** - Loads the cached index and searches in memory (instant)
 3. **Directory Filtering** - By default, only searches within current directory and subdirectories
 4. **Matching** - Supports multiple search modes:
@@ -106,7 +106,7 @@ search --update-index -d C      # Update index for specific drive
 
 - **Initial index build**: 2-5 minutes (one-time setup)
 - **Subsequent searches**: < 500ms for 200K+ files
-- **Index size**: ~50MB per 1M files
+- **Index size**: ~1-5MB per 1M files (compressed)
 - **Memory usage**: Minimal (loads index on-demand)
 
 ## Advanced
