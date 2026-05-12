@@ -78,6 +78,9 @@ class Program
                 return;
             }
 
+            if (!string.IsNullOrWhiteSpace(driveToSearch) && !updateIndex)
+                directoryToSearch = $"{driveToSearch}:\\";
+
             // Use current directory if no directory specified
             if (string.IsNullOrWhiteSpace(directoryToSearch))
             {

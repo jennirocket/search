@@ -5,6 +5,7 @@ using System.Linq;
 using System.Text.RegularExpressions;
 using System.Text.Json;
 using System.Threading.Tasks;
+using System.IO.Compression;
 
 class FileSearcher
 {
@@ -34,7 +35,7 @@ class FileSearcher
         await Task.Run(() =>
         {
             // Flatten all files from all drives
-            var allFiles = _fileIndex.Values.SelectMany(x => x).ToList();
+            var allFiles = _fileIndex.SelectMany(kvp => kvp.Value.Select(f => Path.Combine(kvp.Key, f))).ToList();
 
             // Filter by directory if specified
             if (!string.IsNullOrWhiteSpace(directory))
@@ -106,7 +107,7 @@ class FileSearcher
             {
                 try
                 {
-                    IndexDirectory(drive, files);
+                    IndexDirectory(drive, files, drive);
                 }
                 catch (UnauthorizedAccessException ex)
                 {
@@ -121,7 +122,7 @@ class FileSearcher
         SaveIndex();
     }
 
-    private void IndexDirectory(string path, List<string> files)
+    private void IndexDirectory(string path, List<string> files, string driveRoot)
     {
         try
         {
@@ -134,7 +135,7 @@ class FileSearcher
             // Index files
             foreach (var file in directory.EnumerateFiles())
             {
-                files.Add(file.FullName);
+                files.Add(file.FullName.Replace(driveRoot, "").TrimStart(Path.DirectorySeparatorChar));
             }
 
             // Recursively index subdirectories
@@ -142,7 +143,7 @@ class FileSearcher
             {
                 try
                 {
-                    IndexDirectory(subDir.FullName, files);
+                    IndexDirectory(subDir.FullName, files, driveRoot);
                 }
                 catch (UnauthorizedAccessException)
                 {
@@ -236,7 +237,10 @@ class FileSearcher
         try
         {
             var json = JsonSerializer.Serialize(_fileIndex);
-            File.WriteAllText(_indexPath, json);
+            using var fileStream = File.Create(_indexPath);
+            using var gzipStream = new GZipStream(fileStream, CompressionMode.Compress);
+            using var writer = new StreamWriter(gzipStream);
+            writer.Write(json);
         }
         catch (Exception ex)
         {
@@ -250,7 +254,10 @@ class FileSearcher
         {
             if (File.Exists(_indexPath))
             {
-                var json = File.ReadAllText(_indexPath);
+                using var fileStream = File.OpenRead(_indexPath);
+                using var gzipStream = new GZipStream(fileStream, CompressionMode.Decompress);
+                using var reader = new StreamReader(gzipStream);
+                var json = reader.ReadToEnd();
                 _fileIndex = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(json) ?? new();
             }
         }
