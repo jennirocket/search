@@ -24,6 +24,7 @@ class Program
         string? directoryToSearch = null;
         bool useRegex = false;
         bool updateIndex = false;
+        bool watchForChanges = false;
         bool showAll = false;
 
         for (int i = 0; i < args.Length; i++)
@@ -33,6 +34,10 @@ class Program
                 case "--update-index":
                 case "-u":
                     updateIndex = true;
+                    break;
+                case "--watch":
+                case "-w":
+                    watchForChanges = true;
                     break;
                 case "--regex":
                 case "-r":
@@ -69,6 +74,12 @@ class Program
                 await searcher.BuildIndexAsync(driveToSearch);
                 sw.Stop();
                 Console.WriteLine($"Index updated in {sw.ElapsedMilliseconds}ms");
+                return;
+            }
+
+            if (watchForChanges)
+            {
+                await searcher.WatchAsync(driveToSearch);
                 return;
             }
 
@@ -139,6 +150,7 @@ Options:
   --drive, -d <letter>  Search specific drive (e.g., -d C)
   --all, -a             Show all results (default: first 100)
   --update-index, -u    Rebuild file index
+  --watch, -w           Keep index updated while this process is running
 
 Examples:
   search config.json

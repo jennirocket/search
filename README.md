@@ -8,10 +8,11 @@ A blazing-fast terminal file search tool for Windows that uses indexed searching
 
 ✅ **Directory-based searching** - Search current directory by default (like `find`)  
 ✅ **Indexed searching** - Fast results after initial index build  
+✅ **Live index maintenance** - Keep the index current using `--watch` and automatic rescan logic  
 ✅ **Fuzzy matching** - Find files even if you don't remember exact names  
 ✅ **Regex support** - Advanced pattern matching  
 ✅ **Multi-drive support** - Search all drives or specific ones  
-✅ **Automatic caching** - Index stored locally for quick startup  
+✅ **Automatic caching** - Compressed index stored locally for quick startup  
 
 ## Quick Start
 
@@ -89,14 +90,17 @@ search "^test.*\.cs$" --regex    # Regex search
 search temp --all               # Show all results
 search --update-index           # Rebuild file index
 search --update-index -d C      # Update index for specific drive
+search --watch                  # Keep the index updated while running
+search --watch -d C             # Watch a specific drive
 ```
 
 ## How It Works
 
 1. **Indexing** - Scans your drives recursively and builds a compressed JSON index stored in `%APPDATA%\FileSearch\index.json`
-2. **Searching** - Loads the cached index and searches in memory (instant)
-3. **Directory Filtering** - By default, only searches within current directory and subdirectories
-4. **Matching** - Supports multiple search modes:
+2. **Live refresh** - When `--watch` is enabled, the app monitors file system changes and updates the saved index incrementally or rescans the affected drive when notifications are lost
+3. **Searching** - Loads the cached index and searches in memory (instant)
+4. **Directory Filtering** - By default, only searches within current directory and subdirectories
+5. **Matching** - Supports multiple search modes:
    - **Exact match** - File name exactly matches
    - **Wildcard match** - Using `*` patterns
    - **Fuzzy match** - Smart fuzzy matching with quality thresholds
@@ -118,15 +122,14 @@ The following are automatically skipped during indexing:
 - `.git`, `node_modules`
 - Temp directories (`AppData\Local\Temp`, etc.)
 
-### Scheduled Updates
-Create a Windows Task Scheduler job for automatic index updates:
+### Automatic Updates
+Run the watcher to keep the index current as files and folders are created, renamed, or deleted:
 
 ```powershell
-# Run in admin PowerShell
-$action = New-ScheduledTaskAction -Execute "search" -Argument "--update-index"
-$trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 2am
-Register-ScheduledTask -TaskName "FileSearch Index Update" -Action $action -Trigger $trigger
+search --watch
 ```
+
+The watcher performs a full scan when it starts, then updates the saved index incrementally. It remains active until stopped, so to have it start automatically, create a Windows Task Scheduler task triggered **At log on** with `search` as the program and `--watch` as its argument. Use `--watch -d C` to watch only one drive. A full scan is also triggered automatically if Windows reports that change notifications were lost.
 
 ## Command Reference
 
@@ -139,6 +142,7 @@ Options:
   --drive, -d <letter>  Search entire drive (global search)
   --all, -a             Show all results (default: first 100)
   --update-index, -u    Rebuild file index
+  --watch, -w           Keep index updated while this process is running
 
 Examples:
   search config.json                    # Search current directory
@@ -179,9 +183,9 @@ Normal - some system directories can't be accessed. Run as admin for more comple
 
 - [ ] Use Windows MFT (Master File Table) for even faster indexing
 - [ ] Everything API integration for Windows Search compatibility
-- [ ] Incremental indexing (watch for file changes)
 - [ ] File content search (grep-like functionality)
 - [ ] Exclude patterns configuration file
+- [ ] Improved ranking and relevance tuning for fuzzy matches
 
 ## Contributing
 

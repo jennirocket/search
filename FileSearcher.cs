@@ -1,15 +1,19 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using System.IO.Compression;
 
 class FileSearcher
 {
     private readonly string _indexPath;
+    private readonly string _indexDirectory;
+    private readonly object _indexLock = new();
     private Dictionary<string, List<string>> _fileIndex = new();
 
     public FileSearcher()
@@ -17,6 +21,7 @@ class FileSearcher
         // Store index in user's AppData
         var appDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "FileSearch");
         Directory.CreateDirectory(appDataPath);
+        _indexDirectory = appDataPath;
         _indexPath = Path.Combine(appDataPath, "index.json");
         
         LoadIndex();
@@ -25,17 +30,26 @@ class FileSearcher
     public async Task<List<string>> SearchAsync(string pattern, bool useRegex = false, string? directory = null)
     {
         var results = new List<string>();
-        
-        if (_fileIndex.Count == 0)
+
+        lock (_indexLock)
         {
-            Console.WriteLine("Index is empty. Run 'search --update-index' to build it.");
-            return results;
+            if (_fileIndex.Count == 0)
+            {
+                Console.WriteLine("Index is empty. Run 'search --update-index' to build it.");
+                return results;
+            }
         }
 
         await Task.Run(() =>
         {
             // Flatten all files from all drives
-            var allFiles = _fileIndex.SelectMany(kvp => kvp.Value.Select(f => Path.Combine(kvp.Key, f))).ToList();
+            List<string> allFiles;
+            lock (_indexLock)
+            {
+                allFiles = _fileIndex
+                    .SelectMany(kvp => kvp.Value.Select(f => Path.Combine(kvp.Key, f)))
+                    .ToList();
+            }
 
             // Filter by directory if specified
             if (!string.IsNullOrWhiteSpace(directory))
@@ -92,12 +106,11 @@ class FileSearcher
 
     public async Task BuildIndexAsync(string? specificDrive = null)
     {
-        _fileIndex.Clear();
-
-        var drives = specificDrive != null 
-            ? new[] { $"{specificDrive}:\\" } 
+        var drives = specificDrive != null
+            ? new[] { NormalizeDrive(specificDrive) }
             : DriveInfo.GetDrives().Where(d => d.IsReady).Select(d => d.RootDirectory.FullName).ToArray();
 
+        var indexedDrives = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
         foreach (var drive in drives)
         {
             Console.WriteLine($"Indexing {drive}...");
@@ -115,12 +128,229 @@ class FileSearcher
                 }
             });
 
-            _fileIndex[drive] = files;
+            indexedDrives[drive] = files;
             Console.WriteLine($"  Found {files.Count} files on {drive}");
         }
 
-        SaveIndex();
+        Dictionary<string, List<string>> snapshot;
+        lock (_indexLock)
+        {
+            if (specificDrive == null)
+            {
+                _fileIndex = indexedDrives;
+            }
+            else
+            {
+                foreach (var (drive, files) in indexedDrives)
+                    _fileIndex[drive] = files;
+            }
+
+            snapshot = _fileIndex.ToDictionary(
+                kvp => kvp.Key,
+                kvp => kvp.Value.ToList(),
+                StringComparer.OrdinalIgnoreCase);
+        }
+
+        SaveIndex(snapshot);
     }
+
+    public async Task WatchAsync(string? specificDrive = null)
+    {
+        var drives = specificDrive == null
+            ? DriveInfo.GetDrives().Where(d => d.IsReady).Select(d => d.RootDirectory.FullName).ToArray()
+            : new[] { NormalizeDrive(specificDrive) };
+
+        var changes = new ConcurrentQueue<FileChange>();
+        using var signal = new SemaphoreSlim(0);
+        var watchers = new List<FileSystemWatcher>();
+
+        void Enqueue(FileChange change)
+        {
+            changes.Enqueue(change);
+            signal.Release();
+        }
+
+        try
+        {
+            foreach (var drive in drives)
+            {
+                var watcher = new FileSystemWatcher(drive)
+                {
+                    IncludeSubdirectories = true,
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName,
+                    InternalBufferSize = 64 * 1024,
+                    EnableRaisingEvents = false
+                };
+                watcher.Created += (_, e) => Enqueue(new FileChange(drive, WatcherChangeTypes.Created, e.FullPath, null));
+                watcher.Deleted += (_, e) => Enqueue(new FileChange(drive, WatcherChangeTypes.Deleted, e.FullPath, null));
+                watcher.Renamed += (_, e) => Enqueue(new FileChange(drive, WatcherChangeTypes.Renamed, e.FullPath, e.OldFullPath));
+                watcher.Error += (_, _) => Enqueue(new FileChange(drive, 0, drive, null));
+                watchers.Add(watcher);
+            }
+
+            await BuildIndexAsync(specificDrive);
+
+            foreach (var watcher in watchers)
+            {
+                watcher.EnableRaisingEvents = true;
+                Console.WriteLine($"Watching {watcher.Path} for file changes...");
+            }
+
+            while (true)
+            {
+                await signal.WaitAsync();
+                await Task.Delay(250);
+                while (signal.Wait(0)) { }
+
+                var batch = new List<FileChange>();
+                while (changes.TryDequeue(out var change))
+                    batch.Add(change);
+
+                var rescanDrives = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var change in batch)
+                {
+                    if (change.ChangeType == 0)
+                    {
+                        rescanDrives.Add(change.Drive);
+                        continue;
+                    }
+
+                    ApplyChange(change);
+                }
+
+                foreach (var drive in rescanDrives)
+                    await BuildIndexAsync(drive);
+
+                if (batch.Count > 0)
+                {
+                    if (rescanDrives.Count == 0)
+                        SaveIndex();
+                    Console.WriteLine($"Applied {batch.Count} file change(s).");
+                }
+            }
+        }
+        finally
+        {
+            foreach (var watcher in watchers)
+                watcher.Dispose();
+        }
+    }
+
+    private void ApplyChange(FileChange change)
+    {
+        var relativePath = Path.GetRelativePath(change.Drive, change.FullPath);
+        if (relativePath == "." || relativePath.StartsWith($"..{Path.DirectorySeparatorChar}", StringComparison.Ordinal))
+            return;
+
+        lock (_indexLock)
+        {
+            if (!_fileIndex.TryGetValue(change.Drive, out var files))
+                return;
+
+            if (change.ChangeType == WatcherChangeTypes.Renamed && change.OldFullPath != null)
+            {
+                ApplyRename(change.Drive, files, change.OldFullPath, change.FullPath);
+            }
+            else if (change.ChangeType == WatcherChangeTypes.Deleted)
+            {
+                RemovePathAndDescendants(files, relativePath);
+            }
+            else if (Directory.Exists(change.FullPath))
+            {
+                if (!IsSystemDirectory(change.FullPath))
+                    AddDirectoryToIndex(change.FullPath, files, change.Drive);
+            }
+            else if (File.Exists(change.FullPath))
+            {
+                if (!IsSystemDirectory(change.FullPath) && !files.Contains(relativePath, StringComparer.OrdinalIgnoreCase))
+                    files.Add(relativePath);
+            }
+            else
+            {
+                RemovePathAndDescendants(files, relativePath);
+            }
+        }
+    }
+
+    private void ApplyRename(string drive, List<string> files, string oldFullPath, string newFullPath)
+    {
+        var oldRelativePath = Path.GetRelativePath(drive, oldFullPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var newRelativePath = Path.GetRelativePath(drive, newFullPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var oldPrefix = oldRelativePath + Path.DirectorySeparatorChar;
+        var hasIndexedDescendants = files.Any(file => file.StartsWith(oldPrefix, StringComparison.OrdinalIgnoreCase));
+
+        if (Directory.Exists(newFullPath))
+        {
+            if (IsSystemDirectory(newFullPath))
+            {
+                RemovePathAndDescendants(files, oldRelativePath);
+                return;
+            }
+
+            if (hasIndexedDescendants)
+            {
+                for (var i = 0; i < files.Count; i++)
+                {
+                    if (files[i].StartsWith(oldPrefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var suffix = files[i].Length > oldRelativePath.Length
+                            ? files[i][oldRelativePath.Length..]
+                            : string.Empty;
+                        files[i] = string.Concat(newRelativePath, suffix);
+                    }
+                }
+            }
+            else
+            {
+                AddDirectoryToIndex(newFullPath, files, drive);
+            }
+            RemovePathAndDescendants(files, oldRelativePath);
+        }
+        else
+        {
+            RemovePathAndDescendants(files, oldRelativePath);
+            if (File.Exists(newFullPath) &&
+                !IsSystemDirectory(newFullPath) &&
+                !files.Contains(newRelativePath, StringComparer.OrdinalIgnoreCase))
+            {
+                files.Add(newRelativePath);
+            }
+        }
+    }
+
+    private static void RemovePathAndDescendants(List<string> files, string relativePath)
+    {
+        var prefix = relativePath + Path.DirectorySeparatorChar;
+        files.RemoveAll(file =>
+            file.Equals(relativePath, StringComparison.OrdinalIgnoreCase) ||
+            file.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private void AddDirectoryToIndex(string path, List<string> files, string driveRoot)
+    {
+        var discoveredFiles = new List<string>();
+        IndexDirectory(path, discoveredFiles, driveRoot);
+
+        var knownFiles = new HashSet<string>(files, StringComparer.OrdinalIgnoreCase);
+        files.AddRange(discoveredFiles.Where(knownFiles.Add));
+    }
+
+    private static string NormalizeDrive(string drive)
+    {
+        drive = drive.Trim();
+        if (drive.Length == 1 && char.IsLetter(drive[0]))
+            return $"{drive}:\\";
+        if (drive.Length == 2 && char.IsLetter(drive[0]) && drive[1] == ':')
+            return $"{drive}\\";
+
+        var root = Path.GetPathRoot(drive);
+        if (string.IsNullOrWhiteSpace(root))
+            throw new ArgumentException($"Invalid drive path: {drive}", nameof(drive));
+
+        return root;
+    }
+
+    private readonly record struct FileChange(string Drive, WatcherChangeTypes ChangeType, string FullPath, string? OldFullPath);
 
     private void IndexDirectory(string path, List<string> files, string driveRoot)
     {
@@ -159,6 +389,11 @@ class FileSearcher
 
     private bool IsSystemDirectory(string path)
     {
+        var fullPath = Path.GetFullPath(path);
+        var indexRoot = Path.GetFullPath(_indexDirectory);
+        if (fullPath.StartsWith(indexRoot, StringComparison.OrdinalIgnoreCase))
+            return true;
+
         var systemDirs = new[] 
         { 
             "\\$RECYCLE.BIN",
@@ -171,9 +406,10 @@ class FileSearcher
             "\\.git",
             "\\node_modules",
             "\\AppData\\Local\\Temp",
+            "\\AppData\\Roaming\\FileSearch",
         };
 
-        return systemDirs.Any(dir => path.Contains(dir, StringComparison.OrdinalIgnoreCase));
+        return systemDirs.Any(dir => fullPath.Contains(dir, StringComparison.OrdinalIgnoreCase));
     }
 
     private bool PathMatches(string filename, string pattern)
@@ -234,9 +470,22 @@ class FileSearcher
 
     private void SaveIndex()
     {
+        Dictionary<string, List<string>> snapshot;
+        lock (_indexLock)
+            snapshot = _fileIndex.ToDictionary(
+                kvp => kvp.Key,
+                kvp => kvp.Value.ToList(),
+                StringComparer.OrdinalIgnoreCase);
+
+        SaveIndex(snapshot);
+    }
+
+    private void SaveIndex(Dictionary<string, List<string>> snapshot)
+    {
         try
         {
-            var json = JsonSerializer.Serialize(_fileIndex);
+            var json = JsonSerializer.Serialize(snapshot);
+
             using var fileStream = File.Create(_indexPath);
             using var gzipStream = new GZipStream(fileStream, CompressionMode.Compress);
             using var writer = new StreamWriter(gzipStream);
