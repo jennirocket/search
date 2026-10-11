@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 
 class Program
@@ -25,6 +26,7 @@ class Program
         bool useRegex = false;
         bool updateIndex = false;
         bool watchForChanges = false;
+        bool backgroundWatch = false;
         bool showAll = false;
 
         for (int i = 0; i < args.Length; i++)
@@ -38,6 +40,10 @@ class Program
                 case "--watch":
                 case "-w":
                     watchForChanges = true;
+                    break;
+                case "--watch-background":
+                    watchForChanges = true;
+                    backgroundWatch = true;
                     break;
                 case "--regex":
                 case "-r":
@@ -66,7 +72,13 @@ class Program
 
         try
         {
-            var searcher = new FileSearcher();
+            if (watchForChanges && !backgroundWatch)
+            {
+                StartBackgroundWatcher(driveToSearch);
+                return;
+            }
+
+            var searcher = new FileSearcher(backgroundWatch);
 
             if (updateIndex)
             {
@@ -130,10 +142,51 @@ class Program
         }
         catch (Exception ex)
         {
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($"Error: {ex.Message}");
-            Console.ResetColor();
+            if (backgroundWatch)
+            {
+                var logPath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                    "FileSearch",
+                    "watch.log");
+                File.AppendAllText(logPath, $"[{DateTimeOffset.Now:O}] {ex}{Environment.NewLine}");
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Error: {ex.Message}");
+                Console.ResetColor();
+            }
         }
+    }
+
+    private static void StartBackgroundWatcher(string? drive)
+    {
+        using var watcherLock = new Mutex(false, "Global\\FileSearch_Watcher");
+        if (!watcherLock.WaitOne(0))
+            return;
+
+        var executablePath = Environment.ProcessPath
+            ?? throw new InvalidOperationException("Could not determine the current executable path.");
+        var startInfo = new ProcessStartInfo(executablePath)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        var commandLine = Environment.GetCommandLineArgs();
+        if (Path.GetExtension(commandLine[0]).Equals(".dll", StringComparison.OrdinalIgnoreCase))
+            startInfo.ArgumentList.Add(commandLine[0]);
+
+        startInfo.ArgumentList.Add("--watch-background");
+
+        if (!string.IsNullOrWhiteSpace(drive))
+        {
+            startInfo.ArgumentList.Add("--drive");
+            startInfo.ArgumentList.Add(drive);
+        }
+
+        using var process = Process.Start(startInfo)
+            ?? throw new InvalidOperationException("Could not start the background file watcher.");
     }
 
     static void PrintUsage()

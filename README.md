@@ -118,9 +118,9 @@ search --watch -d C             # Watch a specific drive
 ### Excluded Directories
 The following are automatically skipped during indexing:
 - `$RECYCLE.BIN`, `System Volume Information`
-- `Windows\System32`, `Windows\WinSxS`
+- `Windows\Temp`, `Windows\SoftwareDistribution\Download`, `Windows\System32`, `Windows\WinSxS`, `Windows\Logs`
 - `.git`, `node_modules`
-- Temp directories (`AppData\Local\Temp`, etc.)
+- Temp/cache directories (`ProgramData\Temp`, `AppData\Local\Temp`, `AppData\Local\Microsoft\Windows\INetCache`, etc.)
 
 ### Automatic Updates
 Run the watcher to keep the index current as files and folders are created, renamed, or deleted:
@@ -129,7 +129,18 @@ Run the watcher to keep the index current as files and folders are created, rena
 search --watch
 ```
 
-The watcher performs a full scan when it starts, then updates the saved index incrementally. It remains active until stopped, so to have it start automatically, create a Windows Task Scheduler task triggered **At log on** with `search` as the program and `--watch` as its argument. Use `--watch -d C` to watch only one drive. A full scan is also triggered automatically if Windows reports that change notifications were lost.
+`search --watch` starts the watcher as a hidden background process and returns without printing change notifications. The watcher performs a full scan when it starts, then updates the saved index incrementally. It continues running until Windows shuts down or the process is stopped; it does **not** restart automatically after a reboot.
+
+To have the watcher restart automatically whenever you sign in:
+
+1. Open **Task Scheduler** and select **Create Basic Task**.
+2. Name the task (for example, `FileSearch watcher`) and choose **When I log on** as the trigger.
+3. Choose **Start a program** as the action.
+4. Set **Program/script** to the full path of `search.exe`, usually `%LOCALAPPDATA%\FileSearch\search.exe` (for example, `C:\Users\<your-user>\AppData\Local\FileSearch\search.exe`).
+5. Set **Add arguments** to `--watch`. To watch only one drive, use `--watch -d C`.
+6. Finish and save the task.
+
+The task starts the watcher in the background at sign-in. A full scan is also triggered automatically if Windows reports that change notifications were lost.
 
 ## Command Reference
 
@@ -142,7 +153,7 @@ Options:
   --drive, -d <letter>  Search entire drive (global search)
   --all, -a             Show all results (default: first 100)
   --update-index, -u    Rebuild file index
-  --watch, -w           Keep index updated while this process is running
+  --watch, -w           Start a hidden background index watcher
 
 Examples:
   search config.json                    # Search current directory

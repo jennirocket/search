@@ -19,13 +19,14 @@ if ($?) {
 
 # Restore and build
 Write-Host "Building FileSearch..." -ForegroundColor Yellow
-dotnet restore
+$projectPath = Join-Path $PSScriptRoot "FileSearch.csproj"
+dotnet restore $projectPath
 if (-not $?) {
     Write-Host "ERROR Restore failed" -ForegroundColor Red
     exit 1
 }
 
-dotnet build -c Release
+dotnet build $projectPath -c Release
 if (-not $?) {
     Write-Host "ERROR Build failed" -ForegroundColor Red
     exit 1
@@ -37,7 +38,7 @@ Write-Host ""
 # Publish as standalone
 Write-Host "Publishing standalone executable..." -ForegroundColor Yellow
 $publishPath = "$env:LOCALAPPDATA\FileSearch"
-dotnet publish -c Release -o $publishPath
+dotnet publish $projectPath -c Release -o $publishPath
 if (-not $?) {
     Write-Host "ERROR Publish failed" -ForegroundColor Red
     exit 1
@@ -46,11 +47,29 @@ if (-not $?) {
 Write-Host "OK Published to $publishPath" -ForegroundColor Green
 Write-Host ""
 
+# Create a command alias named 'search' so the tool can be invoked without the app name
+$searchExePath = Join-Path $publishPath "search.exe"
+Copy-Item (Join-Path $publishPath "FileSearch.exe") $searchExePath -Force
+
+$searchCmdPath = Join-Path $publishPath "search.cmd"
+if (-not (Test-Path $searchCmdPath)) {
+    $wrapper = "@echo off`r`n`"$publishPath\FileSearch.exe`" %*"
+    Set-Content -Path $searchCmdPath -Value $wrapper -Encoding ASCII
+}
+
 # Add to PATH
 Write-Host "Adding to system PATH..." -ForegroundColor Yellow
 $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($currentPath -notcontains $publishPath) {
-    [Environment]::SetEnvironmentVariable("Path", "$currentPath;$publishPath", "User")
+if ([string]::IsNullOrWhiteSpace($currentPath)) {
+    $updatedPath = $publishPath
+} elseif ($currentPath -split ';' -notcontains $publishPath) {
+    $updatedPath = "$currentPath;$publishPath"
+} else {
+    $updatedPath = $currentPath
+}
+
+if ($updatedPath -ne $currentPath) {
+    [Environment]::SetEnvironmentVariable("Path", $updatedPath, "User")
     Write-Host "OK Added to PATH" -ForegroundColor Green
     Write-Host ""
     Write-Host "Note: You may need to restart your terminal for PATH changes to take effect" -ForegroundColor Yellow

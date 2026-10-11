@@ -13,17 +13,40 @@ class FileSearcher
 {
     private readonly string _indexPath;
     private readonly string _indexDirectory;
+    private readonly string _watchLogPath;
+    private readonly bool _quiet;
     private readonly object _indexLock = new();
     private Dictionary<string, List<string>> _fileIndex = new();
 
-    public FileSearcher()
+    private static readonly string[] ExcludedPathFragments =
+    {
+        @"\$RECYCLE.BIN",
+        @"\System Volume Information",
+        @"\hiberfil.sys",
+        @"\pagefile.sys",
+        @"\ProgramData\Temp",
+        @"\Windows\Temp",
+        @"\Windows\SoftwareDistribution\Download",
+        @"\Windows\System32",
+        @"\Windows\WinSxS",
+        @"\Windows\Logs",
+        @"\.git",
+        @"\node_modules",
+        @"\AppData\Local\Temp",
+        @"\AppData\Local\Microsoft\Windows\INetCache",
+        @"\AppData\Roaming\FileSearch",
+    };
+
+    public FileSearcher(bool quiet = false)
     {
         // Store index in user's AppData
         var appDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "FileSearch");
         Directory.CreateDirectory(appDataPath);
         _indexDirectory = appDataPath;
         _indexPath = Path.Combine(appDataPath, "index.json");
-        
+        _watchLogPath = Path.Combine(appDataPath, "watch.log");
+        _quiet = quiet;
+
         LoadIndex();
     }
 
@@ -35,7 +58,7 @@ class FileSearcher
         {
             if (_fileIndex.Count == 0)
             {
-                Console.WriteLine("Index is empty. Run 'search --update-index' to build it.");
+                WriteStatus("Index is empty. Run 'search --update-index' to build it.");
                 return results;
             }
         }
@@ -113,7 +136,7 @@ class FileSearcher
         var indexedDrives = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
         foreach (var drive in drives)
         {
-            Console.WriteLine($"Indexing {drive}...");
+            WriteStatus($"Indexing {drive}...");
             var files = new List<string>();
             
             await Task.Run(() =>
@@ -124,12 +147,12 @@ class FileSearcher
                 }
                 catch (UnauthorizedAccessException ex)
                 {
-                    Console.WriteLine($"Access denied: {ex.Message}");
+                    WriteWarning($"Access denied: {ex.Message}");
                 }
             });
 
             indexedDrives[drive] = files;
-            Console.WriteLine($"  Found {files.Count} files on {drive}");
+            WriteStatus($"  Found {files.Count} files on {drive}");
         }
 
         Dictionary<string, List<string>> snapshot;
@@ -156,6 +179,13 @@ class FileSearcher
 
     public async Task WatchAsync(string? specificDrive = null)
     {
+        using var watcherLock = new Mutex(false, "Global\\FileSearch_Watcher");
+        if (!watcherLock.WaitOne(0))
+        {
+            WriteStatus("A watcher is already running for this install.");
+            return;
+        }
+
         var drives = specificDrive == null
             ? DriveInfo.GetDrives().Where(d => d.IsReady).Select(d => d.RootDirectory.FullName).ToArray()
             : new[] { NormalizeDrive(specificDrive) };
@@ -193,7 +223,7 @@ class FileSearcher
             foreach (var watcher in watchers)
             {
                 watcher.EnableRaisingEvents = true;
-                Console.WriteLine($"Watching {watcher.Path} for file changes...");
+                WriteStatus($"Watching {watcher.Path} for file changes...");
             }
 
             while (true)
@@ -225,7 +255,7 @@ class FileSearcher
                 {
                     if (rescanDrives.Count == 0)
                         SaveIndex();
-                    Console.WriteLine($"Applied {batch.Count} file change(s).");
+                    WriteStatus($"Applied {batch.Count} file change(s).");
                 }
             }
         }
@@ -391,25 +421,39 @@ class FileSearcher
     {
         var fullPath = Path.GetFullPath(path);
         var indexRoot = Path.GetFullPath(_indexDirectory);
-        if (fullPath.StartsWith(indexRoot, StringComparison.OrdinalIgnoreCase))
+        if (IsSameOrDescendant(fullPath, indexRoot))
             return true;
 
-        var systemDirs = new[] 
-        { 
-            "\\$RECYCLE.BIN",
-            "\\System Volume Information",
-            "\\hiberfil.sys",
-            "\\pagefile.sys",
-            "\\ProgramData\\Temp",
-            "\\Windows\\System32",
-            "\\Windows\\WinSxS",
-            "\\.git",
-            "\\node_modules",
-            "\\AppData\\Local\\Temp",
-            "\\AppData\\Roaming\\FileSearch",
-        };
+        return ExcludedPathFragments.Any(fragment => ContainsPathFragment(fullPath, fragment));
+    }
 
-        return systemDirs.Any(dir => fullPath.Contains(dir, StringComparison.OrdinalIgnoreCase));
+    private static bool IsSameOrDescendant(string path, string directory)
+    {
+        var normalizedDirectory = Path.TrimEndingDirectorySeparator(directory);
+        return path.Equals(normalizedDirectory, StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith(
+                normalizedDirectory + Path.DirectorySeparatorChar,
+                StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ContainsPathFragment(string path, string fragment)
+    {
+        var index = 0;
+        while ((index = path.IndexOf(fragment, index, StringComparison.OrdinalIgnoreCase)) >= 0)
+        {
+            var end = index + fragment.Length;
+            var endsAtSegmentBoundary =
+                end == path.Length ||
+                path[end] == Path.DirectorySeparatorChar ||
+                path[end] == Path.AltDirectorySeparatorChar;
+
+            if (endsAtSegmentBoundary)
+                return true;
+
+            index = end;
+        }
+
+        return false;
     }
 
     private bool PathMatches(string filename, string pattern)
@@ -484,16 +528,32 @@ class FileSearcher
     {
         try
         {
-            var json = JsonSerializer.Serialize(snapshot);
+            using var saveLock = new Mutex(false, "Global\\FileSearch_IndexSave");
+            if (!saveLock.WaitOne(5000))
+            {
+                WriteWarning("Could not acquire index-save lock. Skipping this update.");
+                return;
+            }
 
-            using var fileStream = File.Create(_indexPath);
-            using var gzipStream = new GZipStream(fileStream, CompressionMode.Compress);
-            using var writer = new StreamWriter(gzipStream);
-            writer.Write(json);
+            var json = JsonSerializer.Serialize(snapshot);
+            var tempPath = _indexPath + ".tmp";
+
+            using (var fileStream = File.Create(tempPath))
+            using (var gzipStream = new GZipStream(fileStream, CompressionMode.Compress))
+            using (var writer = new StreamWriter(gzipStream))
+            {
+                writer.Write(json);
+                writer.Flush();
+            }
+
+            if (File.Exists(_indexPath))
+                File.Replace(tempPath, _indexPath, null);
+            else
+                File.Move(tempPath, _indexPath);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Warning: Could not save index: {ex.Message}");
+            WriteWarning($"Could not save index: {ex.Message}");
         }
     }
 
@@ -501,6 +561,10 @@ class FileSearcher
     {
         try
         {
+            using var saveLock = new Mutex(false, "Global\\FileSearch_IndexSave");
+            if (!saveLock.WaitOne(5000))
+                return;
+
             if (File.Exists(_indexPath))
             {
                 using var fileStream = File.OpenRead(_indexPath);
@@ -512,8 +576,25 @@ class FileSearcher
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Warning: Could not load index: {ex.Message}");
+            WriteWarning($"Could not load index: {ex.Message}");
             _fileIndex = new();
         }
+    }
+
+    private void WriteStatus(string message)
+    {
+        if (!_quiet)
+            Console.WriteLine(message);
+    }
+
+    private void WriteWarning(string message)
+    {
+        if (!_quiet)
+        {
+            Console.WriteLine($"Warning: {message}");
+            return;
+        }
+
+        File.AppendAllText(_watchLogPath, $"[{DateTimeOffset.Now:O}] Warning: {message}{Environment.NewLine}");
     }
 }
